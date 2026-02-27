@@ -1,6 +1,10 @@
 import logger from './logger.js';
 import AuthManager from './auth.js';
 import { refreshAccessToken } from './lib/microsoft-auth.js';
+import { encode as toonEncode } from '@toon-format/toon';
+import type { AppSecrets } from './secrets.js';
+import { getCloudEndpoints } from './cloud-config.js';
+import { getRequestTokens } from './request-context.js';
 
 interface GraphRequestOptions {
   headers?: Record<string, string>;
@@ -32,23 +36,24 @@ interface McpResponse {
 
 class GraphClient {
   private authManager: AuthManager;
-  private accessToken: string | null = null;
-  private refreshToken: string | null = null;
+  private secrets: AppSecrets;
+  private readonly outputFormat: 'json' | 'toon' = 'json';
 
-  constructor(authManager: AuthManager) {
+  constructor(
+    authManager: AuthManager,
+    secrets: AppSecrets,
+    outputFormat: 'json' | 'toon' = 'json'
+  ) {
     this.authManager = authManager;
-  }
-
-  setOAuthTokens(accessToken: string, refreshToken?: string): void {
-    this.accessToken = accessToken;
-    this.refreshToken = refreshToken || null;
+    this.secrets = secrets;
+    this.outputFormat = outputFormat;
   }
 
   async makeRequest(endpoint: string, options: GraphRequestOptions = {}): Promise<unknown> {
-    // Use OAuth tokens if available, otherwise fall back to authManager
+    const contextTokens = getRequestTokens();
     let accessToken =
-      options.accessToken || this.accessToken || (await this.authManager.getToken());
-    let refreshToken = options.refreshToken || this.refreshToken;
+      options.accessToken ?? contextTokens?.accessToken ?? (await this.authManager.getToken());
+    const refreshToken = options.refreshToken ?? contextTokens?.refreshToken;
 
     if (!accessToken) {
       throw new Error('No access token available');
@@ -59,13 +64,8 @@ class GraphClient {
 
       if (response.status === 401 && refreshToken) {
         // Token expired, try to refresh
-        await this.refreshAccessToken(refreshToken);
-
-        // Update token for retry
-        accessToken = this.accessToken || accessToken;
-        if (!accessToken) {
-          throw new Error('Failed to refresh access token');
-        }
+        const newTokens = await this.refreshAccessToken(refreshToken);
+        accessToken = newTokens.accessToken;
 
         // Retry the request with new token
         response = await this.performRequest(endpoint, accessToken, options);
@@ -122,20 +122,32 @@ class GraphClient {
     }
   }
 
-  private async refreshAccessToken(refreshToken: string): Promise<void> {
-    const tenantId = process.env.MS365_MCP_TENANT_ID || 'common';
-    const clientId = process.env.MS365_MCP_CLIENT_ID || '084a3e9f-a9f4-43f7-89f9-d229cf97853e';
-    const clientSecret = process.env.MS365_MCP_CLIENT_SECRET;
+  private async refreshAccessToken(
+    refreshToken: string
+  ): Promise<{ accessToken: string; refreshToken?: string }> {
+    const tenantId = this.secrets.tenantId || 'common';
+    const clientId = this.secrets.clientId;
+    const clientSecret = this.secrets.clientSecret;
 
-    if (!clientSecret) {
-      throw new Error('MS365_MCP_CLIENT_SECRET not configured');
+    // Log whether using public or confidential client
+    if (clientSecret) {
+      logger.info('GraphClient: Refreshing token with confidential client');
+    } else {
+      logger.info('GraphClient: Refreshing token with public client');
     }
 
-    const response = await refreshAccessToken(refreshToken, clientId, clientSecret, tenantId);
-    this.accessToken = response.access_token;
-    if (response.refresh_token) {
-      this.refreshToken = response.refresh_token;
-    }
+    const response = await refreshAccessToken(
+      refreshToken,
+      clientId,
+      clientSecret,
+      tenantId,
+      this.secrets.cloudType
+    );
+
+    return {
+      accessToken: response.access_token,
+      refreshToken: response.refresh_token,
+    };
   }
 
   private async performRequest(
@@ -143,7 +155,10 @@ class GraphClient {
     accessToken: string,
     options: GraphRequestOptions
   ): Promise<Response> {
-    const url = `https://graph.microsoft.com/v1.0${endpoint}`;
+    const cloudEndpoints = getCloudEndpoints(this.secrets.cloudType);
+    const url = `${cloudEndpoints.graphApi}/v1.0${endpoint}`;
+
+    logger.info(`[GRAPH CLIENT] Final URL being sent to Microsoft: ${url}`);
 
     const headers: Record<string, string> = {
       Authorization: `Bearer ${accessToken}`,
@@ -156,6 +171,18 @@ class GraphClient {
       headers,
       body: options.body,
     });
+  }
+
+  private serializeData(data: unknown, outputFormat: 'json' | 'toon', pretty = false): string {
+    if (outputFormat === 'toon') {
+      try {
+        return toonEncode(data);
+      } catch (error) {
+        logger.warn(`Failed to encode as TOON, falling back to JSON: ${error}`);
+        return JSON.stringify(data, null, pretty ? 2 : undefined);
+      }
+    }
+    return JSON.stringify(data, null, pretty ? 2 : undefined);
   }
 
   async graphRequest(endpoint: string, options: GraphRequestOptions = {}): Promise<McpResponse> {
@@ -179,7 +206,7 @@ class GraphClient {
     // If excludeResponse is true, only return success indication
     if (excludeResponse) {
       return {
-        content: [{ type: 'text', text: JSON.stringify({ success: true }) }],
+        content: [{ type: 'text', text: this.serializeData({ success: true }, this.outputFormat) }],
       };
     }
 
@@ -201,14 +228,18 @@ class GraphClient {
 
       if (rawResponse) {
         return {
-          content: [{ type: 'text', text: JSON.stringify(responseData.data) }],
+          content: [
+            { type: 'text', text: this.serializeData(responseData.data, this.outputFormat) },
+          ],
           _meta: meta,
         };
       }
 
       if (responseData.data === null || responseData.data === undefined) {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ success: true }) }],
+          content: [
+            { type: 'text', text: this.serializeData({ success: true }, this.outputFormat) },
+          ],
           _meta: meta,
         };
       }
@@ -229,7 +260,9 @@ class GraphClient {
       removeODataProps(responseData.data as Record<string, unknown>);
 
       return {
-        content: [{ type: 'text', text: JSON.stringify(responseData.data, null, 2) }],
+        content: [
+          { type: 'text', text: this.serializeData(responseData.data, this.outputFormat, true) },
+        ],
         _meta: meta,
       };
     }
@@ -237,13 +270,13 @@ class GraphClient {
     // Original handling for backward compatibility
     if (rawResponse) {
       return {
-        content: [{ type: 'text', text: JSON.stringify(data) }],
+        content: [{ type: 'text', text: this.serializeData(data, this.outputFormat) }],
       };
     }
 
     if (data === null || data === undefined) {
       return {
-        content: [{ type: 'text', text: JSON.stringify({ success: true }) }],
+        content: [{ type: 'text', text: this.serializeData({ success: true }, this.outputFormat) }],
       };
     }
 
@@ -263,7 +296,7 @@ class GraphClient {
     removeODataProps(data as Record<string, unknown>);
 
     return {
-      content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
+      content: [{ type: 'text', text: this.serializeData(data, this.outputFormat, true) }],
     };
   }
 }
