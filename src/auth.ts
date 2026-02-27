@@ -1,10 +1,31 @@
 import type { AccountInfo, Configuration } from '@azure/msal-node';
 import { PublicClientApplication } from '@azure/msal-node';
-import keytar from 'keytar';
 import logger from './logger.js';
 import fs, { existsSync, readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import { getSecrets, type AppSecrets } from './secrets.js';
+import { getCloudEndpoints, getDefaultClientId } from './cloud-config.js';
+
+// Ok so this is a hack to lazily import keytar only when needed
+// since --http mode may not need it at all, and keytar can be a pain to install (looking at you alpine)
+let keytar: typeof import('keytar') | null = null;
+async function getKeytar() {
+  if (keytar === undefined) {
+    return null;
+  }
+  if (keytar === null) {
+    try {
+      keytar = await import('keytar');
+      return keytar;
+    } catch (error) {
+      logger.info('keytar not available, using file-based credential storage');
+      keytar = undefined as any;
+      return null;
+    }
+  }
+  return keytar;
+}
 
 interface EndpointConfig {
   pathPattern: string;
@@ -12,6 +33,7 @@ interface EndpointConfig {
   toolName: string;
   scopes?: string[];
   workScopes?: string[];
+  llmTip?: string;
 }
 
 const __filename = fileURLToPath(import.meta.url);
@@ -28,15 +50,48 @@ const SERVICE_NAME = 'ms-365-mcp-server';
 const TOKEN_CACHE_ACCOUNT = 'msal-token-cache';
 const SELECTED_ACCOUNT_KEY = 'selected-account';
 const FALLBACK_DIR = path.dirname(fileURLToPath(import.meta.url));
-const FALLBACK_PATH = path.join(FALLBACK_DIR, '..', '.token-cache.json');
-const SELECTED_ACCOUNT_PATH = path.join(FALLBACK_DIR, '..', '.selected-account.json');
+const DEFAULT_TOKEN_CACHE_PATH = path.join(FALLBACK_DIR, '..', '.token-cache.json');
+const DEFAULT_SELECTED_ACCOUNT_PATH = path.join(FALLBACK_DIR, '..', '.selected-account.json');
 
-const DEFAULT_CONFIG: Configuration = {
-  auth: {
-    clientId: process.env.MS365_MCP_CLIENT_ID || '084a3e9f-a9f4-43f7-89f9-d229cf97853e',
-    authority: `https://login.microsoftonline.com/${process.env.MS365_MCP_TENANT_ID || 'common'}`,
-  },
-};
+/**
+ * Returns the token cache file path.
+ * Uses MS365_MCP_TOKEN_CACHE_PATH env var if set, otherwise the default fallback.
+ */
+function getTokenCachePath(): string {
+  const envPath = process.env.MS365_MCP_TOKEN_CACHE_PATH?.trim();
+  return envPath || DEFAULT_TOKEN_CACHE_PATH;
+}
+
+/**
+ * Returns the selected-account file path.
+ * Uses MS365_MCP_SELECTED_ACCOUNT_PATH env var if set, otherwise the default fallback.
+ */
+function getSelectedAccountPath(): string {
+  const envPath = process.env.MS365_MCP_SELECTED_ACCOUNT_PATH?.trim();
+  return envPath || DEFAULT_SELECTED_ACCOUNT_PATH;
+}
+
+/**
+ * Ensures the parent directory of a file path exists, creating it recursively if needed.
+ */
+function ensureParentDir(filePath: string): void {
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+}
+
+/**
+ * Creates MSAL configuration from secrets.
+ * This is called during AuthManager initialization.
+ */
+function createMsalConfig(secrets: AppSecrets): Configuration {
+  const cloudEndpoints = getCloudEndpoints(secrets.cloudType);
+  return {
+    auth: {
+      clientId: secrets.clientId || getDefaultClientId(secrets.cloudType),
+      authority: `${cloudEndpoints.authority}/${secrets.tenantId || 'common'}`,
+    },
+  };
+}
 
 interface ScopeHierarchy {
   [key: string]: string[];
@@ -50,10 +105,31 @@ const SCOPE_HIERARCHY: ScopeHierarchy = {
   'Contacts.ReadWrite': ['Contacts.Read'],
 };
 
-function buildScopesFromEndpoints(includeWorkAccountScopes: boolean = false): string[] {
+function buildScopesFromEndpoints(
+  includeWorkAccountScopes: boolean = false,
+  enabledToolsPattern?: string
+): string[] {
   const scopesSet = new Set<string>();
 
+  // Create regex for tool filtering if pattern is provided
+  let enabledToolsRegex: RegExp | undefined;
+  if (enabledToolsPattern) {
+    try {
+      enabledToolsRegex = new RegExp(enabledToolsPattern, 'i');
+      logger.info(`Building scopes with tool filter pattern: ${enabledToolsPattern}`);
+    } catch (error) {
+      logger.error(
+        `Invalid tool filter regex pattern: ${enabledToolsPattern}. Building scopes without filter.`
+      );
+    }
+  }
+
   endpoints.default.forEach((endpoint) => {
+    // Skip endpoints that don't match the tool filter
+    if (enabledToolsRegex && !enabledToolsRegex.test(endpoint.toolName)) {
+      return;
+    }
+
     // Skip endpoints that only have workScopes if not in work mode
     if (!includeWorkAccountScopes && !endpoint.scopes && endpoint.workScopes) {
       return;
@@ -70,14 +146,22 @@ function buildScopesFromEndpoints(includeWorkAccountScopes: boolean = false): st
     }
   });
 
+  // Scope hierarchy: if we have BOTH a higher scope (ReadWrite) AND lower scopes (Read),
+  // keep only the higher scope since it includes the permissions of the lower scopes.
+  // Do NOT upgrade Read to ReadWrite if we only have Read scopes.
   Object.entries(SCOPE_HIERARCHY).forEach(([higherScope, lowerScopes]) => {
-    if (lowerScopes.every((scope) => scopesSet.has(scope))) {
+    if (scopesSet.has(higherScope) && lowerScopes.every((scope) => scopesSet.has(scope))) {
+      // We have both ReadWrite and Read, so remove the redundant Read scope
       lowerScopes.forEach((scope) => scopesSet.delete(scope));
-      scopesSet.add(higherScope);
     }
   });
 
-  return Array.from(scopesSet);
+  const scopes = Array.from(scopesSet);
+  if (enabledToolsPattern) {
+    logger.info(`Built ${scopes.length} scopes for filtered tools: ${scopes.join(', ')}`);
+  }
+
+  return scopes;
 }
 
 interface LoginTestResult {
@@ -99,10 +183,7 @@ class AuthManager {
   private isOAuthMode: boolean;
   private selectedAccountId: string | null;
 
-  constructor(
-    config: Configuration = DEFAULT_CONFIG,
-    scopes: string[] = buildScopesFromEndpoints()
-  ) {
+  constructor(config: Configuration, scopes: string[] = buildScopesFromEndpoints()) {
     logger.info(`And scopes are ${scopes.join(', ')}`, scopes);
     this.config = config;
     this.scopes = scopes;
@@ -116,14 +197,27 @@ class AuthManager {
     this.isOAuthMode = oauthTokenFromEnv != null;
   }
 
+  /**
+   * Creates an AuthManager instance with secrets loaded from the configured provider.
+   * Uses Key Vault if MS365_MCP_KEYVAULT_URL is set, otherwise environment variables.
+   */
+  static async create(scopes: string[] = buildScopesFromEndpoints()): Promise<AuthManager> {
+    const secrets = await getSecrets();
+    const config = createMsalConfig(secrets);
+    return new AuthManager(config, scopes);
+  }
+
   async loadTokenCache(): Promise<void> {
     try {
       let cacheData: string | undefined;
 
       try {
-        const cachedData = await keytar.getPassword(SERVICE_NAME, TOKEN_CACHE_ACCOUNT);
-        if (cachedData) {
-          cacheData = cachedData;
+        const kt = await getKeytar();
+        if (kt) {
+          const cachedData = await kt.getPassword(SERVICE_NAME, TOKEN_CACHE_ACCOUNT);
+          if (cachedData) {
+            cacheData = cachedData;
+          }
         }
       } catch (keytarError) {
         logger.warn(
@@ -131,8 +225,9 @@ class AuthManager {
         );
       }
 
-      if (!cacheData && existsSync(FALLBACK_PATH)) {
-        cacheData = readFileSync(FALLBACK_PATH, 'utf8');
+      const cachePath = getTokenCachePath();
+      if (!cacheData && existsSync(cachePath)) {
+        cacheData = readFileSync(cachePath, 'utf8');
       }
 
       if (cacheData) {
@@ -151,9 +246,12 @@ class AuthManager {
       let selectedAccountData: string | undefined;
 
       try {
-        const cachedData = await keytar.getPassword(SERVICE_NAME, SELECTED_ACCOUNT_KEY);
-        if (cachedData) {
-          selectedAccountData = cachedData;
+        const kt = await getKeytar();
+        if (kt) {
+          const cachedData = await kt.getPassword(SERVICE_NAME, SELECTED_ACCOUNT_KEY);
+          if (cachedData) {
+            selectedAccountData = cachedData;
+          }
         }
       } catch (keytarError) {
         logger.warn(
@@ -161,8 +259,9 @@ class AuthManager {
         );
       }
 
-      if (!selectedAccountData && existsSync(SELECTED_ACCOUNT_PATH)) {
-        selectedAccountData = readFileSync(SELECTED_ACCOUNT_PATH, 'utf8');
+      const accountPath = getSelectedAccountPath();
+      if (!selectedAccountData && existsSync(accountPath)) {
+        selectedAccountData = readFileSync(accountPath, 'utf8');
       }
 
       if (selectedAccountData) {
@@ -180,13 +279,22 @@ class AuthManager {
       const cacheData = this.msalApp.getTokenCache().serialize();
 
       try {
-        await keytar.setPassword(SERVICE_NAME, TOKEN_CACHE_ACCOUNT, cacheData);
+        const kt = await getKeytar();
+        if (kt) {
+          await kt.setPassword(SERVICE_NAME, TOKEN_CACHE_ACCOUNT, cacheData);
+        } else {
+          const cachePath = getTokenCachePath();
+          ensureParentDir(cachePath);
+          fs.writeFileSync(cachePath, cacheData, { mode: 0o600 });
+        }
       } catch (keytarError) {
         logger.warn(
           `Keychain save failed, falling back to file storage: ${(keytarError as Error).message}`
         );
 
-        fs.writeFileSync(FALLBACK_PATH, cacheData);
+        const cachePath = getTokenCachePath();
+        ensureParentDir(cachePath);
+        fs.writeFileSync(cachePath, cacheData, { mode: 0o600 });
       }
     } catch (error) {
       logger.error(`Error saving token cache: ${(error as Error).message}`);
@@ -198,13 +306,22 @@ class AuthManager {
       const selectedAccountData = JSON.stringify({ accountId: this.selectedAccountId });
 
       try {
-        await keytar.setPassword(SERVICE_NAME, SELECTED_ACCOUNT_KEY, selectedAccountData);
+        const kt = await getKeytar();
+        if (kt) {
+          await kt.setPassword(SERVICE_NAME, SELECTED_ACCOUNT_KEY, selectedAccountData);
+        } else {
+          const accountPath = getSelectedAccountPath();
+          ensureParentDir(accountPath);
+          fs.writeFileSync(accountPath, selectedAccountData, { mode: 0o600 });
+        }
       } catch (keytarError) {
         logger.warn(
           `Keychain save failed for selected account, falling back to file storage: ${(keytarError as Error).message}`
         );
 
-        fs.writeFileSync(SELECTED_ACCOUNT_PATH, selectedAccountData);
+        const accountPath = getSelectedAccountPath();
+        ensureParentDir(accountPath);
+        fs.writeFileSync(accountPath, selectedAccountData, { mode: 0o600 });
       }
     } catch (error) {
       logger.error(`Error saving selected account: ${(error as Error).message}`);
@@ -325,7 +442,9 @@ class AuthManager {
       logger.info('Token retrieved successfully, testing Graph API access...');
 
       try {
-        const response = await fetch('https://graph.microsoft.com/v1.0/me', {
+        const secrets = await getSecrets();
+        const cloudEndpoints = getCloudEndpoints(secrets.cloudType);
+        const response = await fetch(`${cloudEndpoints.graphApi}/v1.0/me`, {
           headers: {
             Authorization: `Bearer ${token}`,
           },
@@ -377,18 +496,23 @@ class AuthManager {
       this.selectedAccountId = null;
 
       try {
-        await keytar.deletePassword(SERVICE_NAME, TOKEN_CACHE_ACCOUNT);
-        await keytar.deletePassword(SERVICE_NAME, SELECTED_ACCOUNT_KEY);
+        const kt = await getKeytar();
+        if (kt) {
+          await kt.deletePassword(SERVICE_NAME, TOKEN_CACHE_ACCOUNT);
+          await kt.deletePassword(SERVICE_NAME, SELECTED_ACCOUNT_KEY);
+        }
       } catch (keytarError) {
         logger.warn(`Keychain deletion failed: ${(keytarError as Error).message}`);
       }
 
-      if (fs.existsSync(FALLBACK_PATH)) {
-        fs.unlinkSync(FALLBACK_PATH);
+      const cachePath = getTokenCachePath();
+      if (fs.existsSync(cachePath)) {
+        fs.unlinkSync(cachePath);
       }
 
-      if (fs.existsSync(SELECTED_ACCOUNT_PATH)) {
-        fs.unlinkSync(SELECTED_ACCOUNT_PATH);
+      const accountPath = getSelectedAccountPath();
+      if (fs.existsSync(accountPath)) {
+        fs.unlinkSync(accountPath);
       }
 
       return true;
@@ -457,4 +581,4 @@ class AuthManager {
 }
 
 export default AuthManager;
-export { buildScopesFromEndpoints };
+export { buildScopesFromEndpoints, getTokenCachePath, getSelectedAccountPath };
